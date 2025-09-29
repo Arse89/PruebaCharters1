@@ -1,0 +1,8 @@
+{
+  "name": "charter-map",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:data": "node scripts/fetch_charter.js"
+  }
+}

@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Charter Map</title>
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    .panel {
+      position: absolute; top: 10px; left: 10px; z-index: 5;
+      background: rgba(255,255,255,0.9); padding: 8px 10px; border-radius: 8px;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; font-size: 14px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    }
+    .badge { font-size: 12px; opacity: .8 }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="panel">
+    <button id="loc">Usar mi ubicación</button>
+    <span class="badge" id="updated"></span>
+  </div>
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script>
+    const map = new maplibregl.Map({
+      container: 'map',
+      style: 'https://demotiles.maplibre.org/style.json',
+      center: [-0.3774, 39.4699], // Valencia
+      zoom: 6
+    });
+
+    const km = (a, b) => {
+      const R = 6371, toRad = d => d * Math.PI / 180;
+      const [lat1, lon1] = a, [lat2, lon2] = b;
+      const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
+      const s = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+      return 2*R*Math.asin(Math.sqrt(s));
+    };
+
+    async function load() {
+      const res = await fetch('charter.geojson', { cache: 'no-store' });
+      const gj = await res.json();
+      const updated = document.getElementById('updated');
+      updated.textContent = 'Puntos: ' + (gj.features?.length || 0);
+      map.on('load', () => {
+        map.addSource('charter', { type: 'geojson', data: gj, cluster: true, clusterMaxZoom: 14, clusterRadius: 40 });
+        map.addLayer({ id: 'clusters', type: 'circle', source: 'charter', filter: ['has','point_count'],
+                       paint: {'circle-radius': 16, 'circle-opacity': 0.8} });
+        map.addLayer({ id: 'unclustered', type: 'circle', source: 'charter', filter: ['!has','point_count'],
+                       paint: {'circle-radius': 6, 'circle-opacity': 0.9} });
+        map.addLayer({ id: 'labels', type: 'symbol', source: 'charter', filter: ['!has','point_count'],
+                       layout: { 'text-field': ['get',['coalesce',['get','name'],['get','address']]], 'text-size': 10, 'text-offset': [0, 1.2], 'text-anchor': 'top' } });
+      });
+
+      document.getElementById('loc').onclick = () => {
+        navigator.geolocation.getCurrentPosition(pos => {
+          const me = [pos.coords.latitude, pos.coords.longitude];
+          const nearest = (gj.features||[])
+            .map(f => ({ f, d: km(me, [f.geometry.coordinates[1], f.geometry.coordinates[0]]) }))
+            .sort((a,b)=>a.d-b.d)[0];
+          if (nearest) {
+            map.flyTo({ center: nearest.f.geometry.coordinates, zoom: 14 });
+            alert('Más cercano: ' + (nearest.f.properties.name || nearest.f.properties.address) + '\n' + nearest.d.toFixed(2) + ' km');
+          }
+        }, err => alert('Sin permiso de ubicación'));
+      };
+    }
+    load();
+  </script>
+</body>
+</html>
