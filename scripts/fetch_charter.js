@@ -1,7 +1,13 @@
-// scripts/fetch_charter.js — pagina feeds y confirma marca por get-map/{id}
+// scripts/fetch_charter.js
+// Estrategia: 1) listar IDs por provincia (feeds get-map-list, con paginación real)
+//             2) para cada ID pedir /get-map/{id} y confirmar Charter por el icono
+//             3) cachear detalles por ID para acelerar siguientes runs
 import fs from "node:fs/promises";
 
 const OUT = "docs/charter.geojson";
+const CACHE = "docs/cache-icons.json";
+
+// Feeds provinciales conocidos (añade más si haces falta; intenta ES y VA)
 const FEEDS = [
   "https://www.consum.es/get-map-list/block_supermercados_en_barcelona/",
   "https://www.consum.es/va/get-map-list/block_supermercados_en_valencia/",
@@ -21,7 +27,7 @@ async function getText(url){
       const t = await r.text();
       if(!r.ok) throw new Error(`HTTP ${r.status} ${t.slice(0,120)}`);
       return t;
-    } catch(e){ if(i===3) throw e; await sleep(400*i); }
+    }catch(e){ if(i===3) throw e; await sleep(400*i); }
   }
 }
 async function getJson(url){ return JSON.parse(await getText(url)); }
@@ -36,11 +42,11 @@ function findFeatures(obj){
   return null;
 }
 
-// pagina ?page=1..9 y ?p=1..9 (el base ya trae page=0 -> 20 items)
-async function fetchAllPages(base){
+// Paginación real (algunos devuelven 200 por página): probamos ?page= y ?p=
+async function fetchAllPageFeatures(base){
   const urls = [base];
-  for(let i=1;i<=9;i++) urls.push(`${base}?page=${i}`);
-  for(let i=1;i<=9;i++) urls.push(`${base}?p=${i}`);
+  for(let i=1;i<=20;i++) urls.push(`${base}?page=${i}`);
+  for(let i=1;i<=20;i++) urls.push(`${base}?p=${i}`);
   const out = [];
   for(const u of urls){
     try{
@@ -48,81 +54,120 @@ async function fetchAllPages(base){
       const feats = findFeatures(j) || [];
       if(!feats.length) continue;
       out.push(...feats);
-      // heurística: si <20, no hay más páginas de este modo
-      if(feats.length < 20 && (u.includes("?page=")||u.includes("?p="))) break;
+      // heurística: si <200, probablemente ya no hay más
+      if((u.includes("?page=")||u.includes("?p=")) && feats.length < 200) break;
     }catch{}
-    await sleep(150);
+    await sleep(120);
   }
   return out;
 }
 
-async function getIconById(id){
-  try{
-    const j = await getJson(`https://www.consum.es/get-map/${id}/`);
-    const f = (findFeatures(j)||[])[0];
-    return String(f?.properties?.icon || "");
-  }catch{ return ""; }
+// --- Caché de detalles por ID ---
+async function loadCache(){
+  try{ return JSON.parse(await fs.readFile(CACHE,"utf-8")); }catch{ return {}; }
+}
+async function saveCache(cache){
+  await fs.mkdir("docs",{recursive:true});
+  await fs.writeFile(CACHE, JSON.stringify(cache));
 }
 
-async function toFeature(raw, source){
-  // coords
-  let lon=null, lat=null;
-  const c = raw?.geometry?.coordinates;
-  if(Array.isArray(c) && c.length>=2){ lon=+c[0]; lat=+c[1]; }
-  if((lon==null||lat==null) && raw?.properties?.data?.field_coordenadas){
-    const wkt = String(raw.properties.data.field_coordenadas);
-    let m = /POINT\s*\(\s*(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s*\)/i.exec(wkt);
-    if(m){ lon=+m[1]; lat=+m[2]; }
-    if(lon==null||lat==null){ m=/(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)/.exec(wkt); if(m){ lat=+m[1]; lon=+m[2]; } }
+// Pide detalle por ID (ES o VA) y devuelve {icon, name, desc, geometry}
+async function getDetailsById(id){
+  const urls = [
+    `https://www.consum.es/get-map/${id}/`,
+    `https://www.consum.es/va/get-map/${id}/`
+  ];
+  for(const u of urls){
+    try{
+      const j = await getJson(u);
+      const f = (findFeatures(j)||[])[0];
+      if(!f) continue;
+      const icon = String(f?.properties?.icon || "");
+      const name = strip(f?.properties?.tooltip || f?.properties?.title || "");
+      const desc = strip(f?.properties?.description || "");
+      const geom = f?.geometry;
+      return { icon, name, desc, geom };
+    }catch{}
+    await sleep(80);
   }
-  if(lon==null||lat==null) return null;
-
-  const name = strip(raw?.properties?.tooltip || raw?.properties?.title || raw?.properties?.data?.title);
-  const addr = strip(raw?.properties?.data?.field_domicilio || raw?.properties?.field_domicilio || raw?.properties?.description);
-  const id = String(raw?.properties?.entity_id || `${name}|${addr}`).toLowerCase();
-
-  // SIEMPRE confirma marca por id (muchos feeds no traen icon correcto)
-  const iconFeed = String(raw?.properties?.icon || "");
-  const icon = (await getIconById(id)) || iconFeed;
-  const isCharter = /charter/i.test(icon) || /\bcharter\b/i.test(name) || /\bcharter\b/i.test(addr);
-  if(!isCharter) return null;
-
-  return {
-    type:"Feature",
-    geometry:{ type:"Point", coordinates:[lon,lat] },
-    properties:{ id, name, address: addr, brand:"Charter", icon, source }
-  };
+  return { icon:"", name:"", desc:"", geom:null };
 }
 
-function dedupe(features){
-  const m = new Map();
-  for(const f of features){
-    const k = f.properties.id || JSON.stringify(f.geometry.coordinates);
-    if(!m.has(k)) m.set(k,f);
+function dedupeIds(ids){ return [...new Set(ids)]; }
+function isCharterBy(icon, text){ return /charter/i.test(icon) || /\bcharter\b/i.test(text); }
+
+// Pool de concurrencia
+async function mapPool(items, fn, size=8){
+  const out = []; let i=0;
+  async function worker(){
+    while(i<items.length){
+      const idx = i++; const r = await fn(items[idx], idx);
+      if(r) out.push(r);
+      await sleep(40);
+    }
   }
-  return [...m.values()];
+  await Promise.all(Array.from({length:size}, worker));
+  return out;
 }
 
 async function main(){
-  const all = [];
+  // 1) Recoger TODOS los entity_id de todas las páginas de cada feed
+  const allIds = [];
   for(const base of FEEDS){
-    const feats = await fetchAllPages(base);
-    const mapped = [];
-    for(const f of feats){
-      const g = await toFeature(f, base);
-      if(g) mapped.push(g);
-      await sleep(120); // rate limit por tienda
-    }
-    console.log(`OK ${base} → total=${feats.length} charter=${mapped.length}`);
-    all.push(...mapped);
+    const feats = await fetchAllPageFeatures(base);
+    const ids = feats.map(f => f?.properties?.entity_id).filter(Boolean);
+    console.log(`IDs ${base}: ${ids.length}`);
+    allIds.push(...ids);
   }
-  const fc = { type:"FeatureCollection", features: dedupe(all) };
+  const uniqueIds = dedupeIds(allIds);
+  console.log("IDs totales únicos:", uniqueIds.length);
 
+  // 2) Cargar caché y resolver SOLO los que falten
+  const cache = await loadCache();
+  const missing = uniqueIds.filter(id => !cache[id]);
+  console.log("IDs sin cache:", missing.length);
+
+  const resolved = await mapPool(missing, async (id)=>{
+    const det = await getDetailsById(id);
+    cache[id] = {
+      icon: det.icon,
+      name: det.name,
+      desc: det.desc,
+      geom: det.geom
+    };
+    return true;
+  }, 8);
+
+  await saveCache(cache);
+
+  // 3) Construir GeoJSON solo con Charter
+  const featsOut = [];
+  for(const id of uniqueIds){
+    const det = cache[id] || {};
+    const icon = det.icon || "";
+    const text = `${det.name||""} ${det.desc||""}`;
+    const charter = isCharterBy(icon, text);
+    const geom = det.geom;
+    if(!charter || !geom || !Array.isArray(geom.coordinates)) continue;
+    featsOut.push({
+      type:"Feature",
+      geometry: geom,
+      properties:{
+        id: String(id),
+        name: det.name || "",
+        address: strip(det.desc || ""), // el desc suele contener domicilio
+        brand: "Charter",
+        icon
+      }
+    });
+  }
+
+  const fc = { type:"FeatureCollection", features: featsOut };
   if(fc.features.length===0){
     console.error("Vacío. Conservo charter.geojson anterior si existe.");
     try{ await fs.access(OUT); process.exit(0); }catch{}
   }
-  await fs.mkdir("docs", {recursive:true});
+  await fs.mkdir("docs",{recursive:true});
   await fs.writeFile(OUT, JSON.stringify(fc));
   console.log("TOTAL Charter:", fc.features.length);
 }
