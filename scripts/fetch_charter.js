@@ -1,32 +1,38 @@
-// scripts/fetch_charter.js
+// scripts/fetch_charter.js — autodiscovery de feeds y filtro Charter
 import fs from 'node:fs/promises';
 
 const OUT = 'docs/charter.geojson';
-
-// Provincias iniciales. Puedes añadir más.
-const PROVINCES = ['barcelona','valencia','alicante','castellon','murcia','albacete'];
-
-// La web tiene versión ES y VA. Probamos ambas.
-const BASES = ['https://www.consum.es', 'https://www.consum.es/va'];
+const BASES = ['https://www.consum.es/supermercados/', 'https://www.consum.es/va/supermercados/'];
 
 const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
-const stripHtml = (s='')=>s.replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim();
+const stripHtml = (s='')=>String(s||'').replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim();
 
-// 1) Descarga SIEMPRE como texto y luego JSON.parse (a veces el header no es JSON)
-async function fetchJson(url){
-  for(let attempt=1; attempt<=3; attempt++){
+async function getText(url){
+  for(let i=1;i<=3;i++){
     try{
-      const r = await fetch(url, { headers: { 'accept': '*/*' } });
-      const txt = await r.text();
-      return JSON.parse(txt);
-    }catch(e){
-      if(attempt===3) throw e;
-      await sleep(500*attempt);
-    }
+      const r = await fetch(url, { headers:{accept:'*/*'} });
+      if(!r.ok) throw new Error(`HTTP ${r.status}`);
+      return await r.text();
+    }catch(e){ if(i===3) throw e; await sleep(400*i); }
   }
 }
 
-// 2) Encuentra "features" aunque estén anidadas en estructuras Drupal
+async function getJson(url){
+  const txt = await getText(url);        // a veces responde JSON con content-type raro
+  return JSON.parse(txt);
+}
+
+// Captura todos los endpoints .../get-map-list/... presentes en la página
+async function discoverFeeds(){
+  const urls = new Set();
+  for(const base of BASES){
+    const html = await getText(base);
+    const re = /https?:\/\/[^"' ]+\/get-map-list\/[^"' )]+/gi;
+    let m; while((m = re.exec(html))){ urls.add(m[0]); }
+  }
+  return [...urls];
+}
+
 function findFeatures(obj){
   if(!obj) return null;
   if(Array.isArray(obj)){
@@ -41,95 +47,74 @@ function findFeatures(obj){
   }
   return null;
 }
-const extractFeatures = (j)=> findFeatures(j) || [];
 
-// 3) Intenta el feed por provincia en ES y VA
-async function getProvince(slug){
-  for(const base of BASES){
-    const url = `${base}/get-map-list/block_supermercados_en_${slug}/`;
-    try{
-      const j = await fetchJson(url);
-      const feats = extractFeatures(j);
-      if(feats.length) return { url, feats };
-    }catch{/* probar siguiente base */}
-  }
-  return { url:null, feats:[] };
-}
-
-// 4) Mapea item → Feature. Filtra Charter por icono.
-//    Extrae coords de geometry o de WKT/latlon en field_coordenadas.
-function toFeature(raw, slug, sourceUrl){
-  const icon = String(raw?.properties?.icon || '').toLowerCase();
-  const isCharter = icon.includes('charter');
+function toFeature(raw, sourceUrl){
+  const icon = String(raw?.properties?.icon || '');
+  const name = stripHtml(raw?.properties?.tooltip || raw?.properties?.title || raw?.properties?.data?.title);
+  const addr = stripHtml(raw?.properties?.data?.field_domicilio || raw?.properties?.field_domicilio || raw?.properties?.description);
+  const isCharter = /charter/i.test(icon) || /\bcharter\b/i.test(name) || /\bcharter\b/i.test(addr);
 
   // coords
-  let lon = null, lat = null;
-  const coords = raw?.geometry?.coordinates;
-  if(Array.isArray(coords) && coords.length>=2){
-    lon = Number(coords[0]); lat = Number(coords[1]);
-  }
-  // WKT "POINT (lon lat)"
-  if((lon==null || lat==null) && raw?.properties?.data?.field_coordenadas){
+  let lon=null, lat=null;
+  const c = raw?.geometry?.coordinates;
+  if(Array.isArray(c) && c.length>=2){ lon=+c[0]; lat=+c[1]; }
+  if((lon==null||lat==null) && raw?.properties?.data?.field_coordenadas){
     const wkt = String(raw.properties.data.field_coordenadas);
-    const m = /POINT\s*\(\s*(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s*\)/i.exec(wkt);
-    if(m){ lon = Number(m[1]); lat = Number(m[2]); }
-  }
-  // "lat, lon"
-  if((lon==null || lat==null) && raw?.properties?.data?.field_coordenadas){
-    const m = String(raw.properties.data.field_coordenadas).match(/(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)/);
-    if(m){ lat = Number(m[1]); lon = Number(m[2]); }
+    let m = /POINT\s*\(\s*(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s*\)/i.exec(wkt);
+    if(m){ lon=+m[1]; lat=+m[2]; }
+    if(lon==null||lat==null){
+      m = /(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)/.exec(wkt); // lat, lon
+      if(m){ lat=+m[1]; lon=+m[2]; }
+    }
   }
 
-  const name = stripHtml(raw?.properties?.tooltip || raw?.properties?.title || raw?.properties?.data?.title || '');
-  const addr = stripHtml(raw?.properties?.data?.field_domicilio || raw?.properties?.field_domicilio || raw?.properties?.description || '');
-  const id = String(raw?.properties?.entity_id || `${name}|${addr}`.toLowerCase());
-
+  const id = String(raw?.properties?.entity_id || `${name}|${addr}`).toLowerCase();
   if(!isCharter || lon==null || lat==null) return null;
 
   return {
     type:'Feature',
     geometry:{ type:'Point', coordinates:[lon,lat] },
-    properties:{
-      id, name, address: addr, province: slug,
-      brand:'Charter', icon: raw?.properties?.icon || '',
-      source: sourceUrl
-    }
+    properties:{ id, name, address: addr, brand:'Charter', icon, source: sourceUrl }
   };
 }
 
 function dedupe(features){
-  const seen = new Map();
+  const map = new Map();
   for(const f of features){
     const k = f.properties.id;
-    if(!seen.has(k)) seen.set(k,f);
+    if(!map.has(k)) map.set(k,f);
   }
-  return [...seen.values()];
+  return [...map.values()];
 }
 
-// 5) Main
 async function main(){
-  const all = [];
-  for(const slug of PROVINCES){
-    const {url, feats} = await getProvince(slug);
-    if(!feats.length){ console.warn('Sin datos en', slug); continue; }
-    const mapped = feats.map(f=>toFeature(f, slug, url)).filter(Boolean);
-    all.push(...mapped);
-    await sleep(300);
-  }
-  const fc = { type:'FeatureCollection', features: dedupe(all) };
+  const feedUrls = await discoverFeeds();
+  if(!feedUrls.length) throw new Error('No se descubrieron feeds get-map-list');
 
-  // Sanity: si vacío, no sobrescribas el último bueno
-  if(fc.features.length===0){
-    console.error('Resultado vacío. Conservo el charter.geojson anterior si existe.');
+  console.log('Feeds detectados:', feedUrls.length);
+  const all = [];
+  for(const url of feedUrls){
     try{
-      await fs.access(OUT); // existe → salir sin escribir
-      process.exit(0);
-    }catch{
-      // no existe → escribir vacío
+      const j = await getJson(url);
+      const feats = findFeatures(j) || [];
+      const mapped = feats.map(f=>toFeature(f, url)).filter(Boolean);
+      console.log(`OK ${url} → total=${feats.length} charter=${mapped.length}`);
+      all.push(...mapped);
+      await sleep(200);
+    }catch(e){
+      console.warn('Fallo en', url, String(e).slice(0,120));
     }
+  }
+
+  const deduped = dedupe(all);
+  const fc = { type:'FeatureCollection', features: deduped };
+
+  if(fc.features.length===0){
+    console.error('Resultado vacío. Conservo charter.geojson anterior si existe.');
+    try{ await fs.access(OUT); process.exit(0); }catch{}
   }
   await fs.mkdir('docs', {recursive:true});
   await fs.writeFile(OUT, JSON.stringify(fc));
-  console.log('Charter features:', fc.features.length);
+  console.log('TOTAL Charter:', fc.features.length);
 }
 main().catch(err=>{ console.error(err); process.exit(1); });
