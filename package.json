@@ -1,11 +1,11 @@
 {
-  "name":"charter-map",
-  "private":true,
-  "type":"module",
-  "scripts":{
-    "build:data":"node scripts/sweep_charter.js"
+  "name": "charter-map",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:data": "node scripts/sweep_charter.js"
   },
-  "dependencies":{
-    "playwright":"^1.47.2"
+  "dependencies": {
+    "playwright": "^1.47.2"
   }
 }
