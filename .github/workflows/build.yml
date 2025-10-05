@@ -1,23 +1,22 @@
 name: Build dataset
+permissions:
+  contents: write
 on:
+  workflow_dispatch:
   schedule:
     - cron: "0 2 * * *"   # 02:00 Europe/Madrid
-  workflow_dispatch:
-
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
       - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - name: Install
-        run: npm ci --ignore-scripts
+        with: { node-version: 20 }
+      - name: Node version
+        run: node -v
       - name: Build dataset
-        run: npm run build:data
+        run: node scripts/fetch_charter.js
       - name: Snapshot diario
         run: |
           mkdir -p docs/history
