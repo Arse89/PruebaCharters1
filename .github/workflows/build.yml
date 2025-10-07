@@ -49,4 +49,3 @@ jobs:
         if: always()
         run: |
           test -f docs/debug/STATS.json && cat docs/debug/STATS.json || echo "Sin STATS"
-```0
