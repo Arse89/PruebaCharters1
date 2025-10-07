@@ -1,6 +1,5 @@
-// scripts/step2_feed.js — lee un feed y lo vuelca a GeoJSON sin filtros
+// Lee un feed público (Barcelona) y vuelca TODO a docs/charter.geojson
 import fs from "node:fs/promises";
-
 const FEED = "https://www.consum.es/get-map-list/block_supermercados_en_barcelona/";
 const OUT  = "docs/charter.geojson";
 
@@ -18,19 +17,17 @@ async function getText(url){
   }
 }
 
-// encuentra "features" aunque vengan anidadas (Drupal)
 function findFeatures(obj){
   if(!obj) return null;
-  if(Array.isArray(obj)){ for(const el of obj){ const f = findFeatures(el); if(f) return f; } return null; }
+  if(Array.isArray(obj)){ for(const el of obj){ const f=findFeatures(el); if(f) return f; } return null; }
   if(typeof obj==="object"){
     if(Array.isArray(obj.features)) return obj.features;
-    for(const v of Object.values(obj)){ const f = findFeatures(v); if(f) return f; }
+    for(const v of Object.values(obj)){ const f=findFeatures(v); if(f) return f; }
   }
   return null;
 }
 
 function toFeature(raw){
-  // coords: geometry o field_coordenadas (WKT o "lat, lon")
   let lon=null, lat=null;
   const c = raw?.geometry?.coordinates;
   if(Array.isArray(c) && c.length>=2){ lon=+c[0]; lat=+c[1]; }
@@ -39,7 +36,7 @@ function toFeature(raw){
     let m = /POINT\s*\(\s*(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s*\)/i.exec(String(coordStr));
     if(m){ lon=+m[1]; lat=+m[2]; }
     if(lon==null||lat==null){
-      m = /(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)/.exec(String(coordStr)); // lat, lon
+      m = /(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)/.exec(String(coordStr));
       if(m){ lat=+m[1]; lon=+m[2]; }
     }
   }
@@ -66,17 +63,11 @@ async function main(){
   const fc = {
     type:"FeatureCollection",
     features: mapped,
-    metadata: {
-      source: FEED,
-      generated_at: new Date().toISOString(),
-      total_raw: feats.length,
-      total_mapped: mapped.length
-    }
+    metadata: { source: FEED, generated_at: new Date().toISOString(), total_raw: feats.length, total_mapped: mapped.length }
   };
 
   await fs.mkdir("docs",{recursive:true});
   await fs.writeFile(OUT, JSON.stringify(fc));
   console.log(`RAW=${feats.length}  MAPPED=${mapped.length}  → ${OUT}`);
-  if (mapped[0]) console.log("SAMPLE:", mapped[0].properties);
 }
 main().catch(e=>{ console.error(e); process.exit(1); });
