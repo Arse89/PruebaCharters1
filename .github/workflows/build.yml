@@ -13,7 +13,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
       - name: Construir dataset (step2)
-        run: node scripts/step3.js
+        run: node scripts/step4.js
       - name: Snapshot diario
         run: |
           mkdir -p docs/history
