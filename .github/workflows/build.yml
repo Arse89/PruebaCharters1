@@ -13,7 +13,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
       - name: Construir dataset
-        run: node scripts/crawl_charter_from_city_pages.js
+        run: node scripts/step4.js
       - name: Commit si hay cambios
         run: |
           git config user.name bot
