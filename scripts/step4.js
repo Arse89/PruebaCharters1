@@ -1,8 +1,9 @@
-// Sonda: ciudad -> fichas -> node id -> get-map/{id} -> ¿Charter?
+// step4.js — Sonda: ciudad -> fichas -> node id -> get-map/{id} -> ¿Charter?
+// Edita CITY_PATHS si quieres otra ciudad.
 import fs from "node:fs/promises";
 
 const ORIGIN = "https://www.consum.es";
-const CITY_URL = `${ORIGIN}/supermercados/barcelona/`;   // cambia ciudad si quieres
+const CITY_PATHS = ["/supermercados/barcelona/", "/va/supermercats/barcelona/"]; // cambia aquí
 const OUT = "docs/debug/probe.json";
 
 const sleep = ms => new Promise(r=>setTimeout(r,ms));
@@ -22,10 +23,10 @@ async function getJson(u, ms=12000){
 
 function extractStoreUrls(html){
   const urls = new Set();
-  // Relativos y absolutos (ES y VA)
+  // ES y VA, relativos o absolutos
   const re = /href=["'](?:https?:\/\/www\.consum\.es)?(\/(?:va\/)?supermercad[oa]s\/[^"'#?]+\/[^"'#?\/]+\/?)["']/gi;
   let m; while((m=re.exec(html))) urls.add(ORIGIN + m[1]);
-  // filtra listados de ciudad (terminan en /ciudad/)
+  // quita listados de ciudad (terminan en /ciudad/)
   for(const u of [...urls]){
     if(/\/supermercados\/[^/]+\/$/i.test(u) || /\/va\/supermercats\/[^/]+\/$/i.test(u)) urls.delete(u);
   }
@@ -72,24 +73,38 @@ function isCharter(icon="", text=""){
 }
 
 async function main(){
-  const htmlList = await get(CITY_URL, 12000);
-  const storeUrls = extractStoreUrls(htmlList).slice(0, 30); // 30 primeras para prueba
   const results = [];
-  let withId = 0, withDetail = 0, charter = 0;
+  let totalUrls = 0, idsCount = 0, detailCount = 0, charterCount = 0;
 
-  for(const u of storeUrls){
-    const html = await get(u, 12000);
+  // 1) recoge URLs de fichas desde ambas rutas (ES y VA)
+  const storeUrls = new Set();
+  for(const path of CITY_PATHS){
+    try{
+      const htmlList = await get(ORIGIN + path, 12000);
+      extractStoreUrls(htmlList).forEach(u => storeUrls.add(u));
+    }catch{}
+    await sleep(120);
+  }
+  const urlsArr = [...storeUrls];
+  totalUrls = urlsArr.length;
+
+  // 2) procesa hasta 50 fichas para prueba rápida
+  for(const u of urlsArr.slice(0, 50)){
+    let html;
+    try { html = await get(u, 12000); } catch { continue; }
+
     const id = pickNodeId(html);
     const row = { url: u, id: id || null, icon: null, name: null, charter: false };
+
     if(id){
-      withId++;
+      idsCount++;
       const det = await getDetail(id);
       if(det){
-        withDetail++;
+        detailCount++;
         row.icon = det.icon;
         row.name = det.name;
         row.charter = isCharter(det.icon, `${det.name} ${det.desc}`);
-        if(row.charter) charter++;
+        if(row.charter) charterCount++;
       }
     }
     results.push(row);
@@ -98,11 +113,14 @@ async function main(){
 
   await fs.mkdir("docs/debug", { recursive: true });
   await fs.writeFile(OUT, JSON.stringify({
-    city_url: CITY_URL,
-    total_urls: storeUrls.length,
-    with_id, with_detail, charter,
+    city_paths: CITY_PATHS,
+    total_urls: totalUrls,
+    ids: idsCount,
+    detail: detailCount,
+    charter: charterCount,
     sample: results.slice(0,10)
   }, null, 2));
-  console.log(`URLs=${storeUrls.length}  IDs=${withId}  DETAIL=${withDetail}  CHARTER=${charter}  → ${OUT}`);
+
+  console.log(`URLs=${totalUrls}  IDs=${idsCount}  DETAIL=${detailCount}  CHARTER=${charterCount}  → ${OUT}`);
 }
 main().catch(e=>{ console.error(e); process.exit(1); });
