@@ -1,15 +1,18 @@
-// step4c: Barcelona -> pagina todo (como step3) -> confirma Charter por get-map/{id}
-// y si no queda claro, consulta /node/{id} (HTML) buscando "Charter".
+// Abre /supermercados/, cambia a "Listado", activa filtro "Charter",
+// pagina todo el listado, extrae IDs y luego saca coords con get-map/{id}.
+// Es simple: sin AJAX manual, sin grid de mapa.
 import fs from "node:fs/promises";
+import { chromium } from "playwright";
 
-const BASE = "https://www.consum.es/get-map-list/block_supermercados_en_barcelona/";
-const OUT  = "docs/charter.geojson";
+const START = "https://www.consum.es/supermercados/";
+const OUT   = "docs/charter.geojson";
 
 const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
 const strip = (s="")=>String(s).replace(/<[^>]*>/g," ").replace(/\s+/g," ").trim();
+const isCharter = (icon="", text="") => /charter/i.test(icon) || /\bcharter\b/i.test(text);
 
 async function getText(url, ms=12000){
-  const ctrl = new AbortController(); const t=setTimeout(()=>ctrl.abort(), ms);
+  const ctrl = new AbortController(); const t = setTimeout(()=>ctrl.abort(), ms);
   try{
     const r = await fetch(url, { headers:{accept:"*/*"}, signal: ctrl.signal });
     const txt = await r.text();
@@ -17,52 +20,19 @@ async function getText(url, ms=12000){
     return txt;
   } finally { clearTimeout(t); }
 }
-const getJson = async (url, ms)=> JSON.parse(await getText(url, ms));
-
-function findFeatures(o){
-  if(!o) return null;
-  if(Array.isArray(o)){ for(const x of o){ const f=findFeatures(x); if(f) return f; } return null; }
-  if(typeof o==="object"){
-    if(Array.isArray(o.features)) return o.features;
-    for(const v of Object.values(o)){ const f=findFeatures(v); if(f) return f; }
+function findFeatures(obj){
+  if(!obj) return null;
+  if(Array.isArray(obj)){ for(const el of obj){ const f=findFeatures(el); if(f) return f; } return null; }
+  if(typeof obj==="object"){
+    if(Array.isArray(obj.features)) return obj.features;
+    for(const v of Object.values(obj)){ const f=findFeatures(v); if(f) return f; }
   }
   return null;
 }
-
-async function fetchPage(url){
-  try{ return findFeatures(await getJson(url)) || []; } catch { return []; }
-}
-
-async function fetchAllIds(){
-  const seen = new Set(), raws = [];
-  // primera
-  for (const f of await fetchPage(BASE)){
-    const id = String(f?.properties?.entity_id||""); if(id && !seen.has(id)){ seen.add(id); raws.push(f); }
-  }
-  // modos de paginación con corte por “no crecimiento”
-  for (const mode of ["page","p"]) {
-    let stagnant = 0;
-    for (let i=1;i<=20;i++){
-      const url = `${BASE}?${mode}=${i}`;
-      const feats = await fetchPage(url);
-      let grew = 0;
-      for (const f of feats){
-        const id = String(f?.properties?.entity_id||"");
-        if(id && !seen.has(id)){ seen.add(id); raws.push(f); grew++; }
-      }
-      stagnant = grew===0 ? stagnant+1 : 0;
-      if (stagnant>=2) break;
-      await sleep(120);
-    }
-  }
-  return { ids:[...seen], raws };
-}
-
-// --- detalle por ID ---
 async function getDetailsById(id){
-  for (const base of ["https://www.consum.es","https://www.consum.es/va"]) {
+  for(const base of ["https://www.consum.es","https://www.consum.es/va"]){
     try{
-      const j = await getJson(`${base}/get-map/${id}/`, 10000);
+      const j = JSON.parse(await getText(`${base}/get-map/${id}/`, 10000));
       const f = (findFeatures(j)||[])[0];
       if(!f) continue;
       return {
@@ -77,85 +47,123 @@ async function getDetailsById(id){
   return { icon:"", name:"", desc:"", geom:null };
 }
 
-// --- fallback HTML /node/{id} ---
-async function getHtmlFlagByNode(id){
-  try{
-    const html = await getText(`https://www.consum.es/node/${id}`, 10000);
-    const text = strip(html);
-    const isCharter = /\bcharter\b/i.test(text) || /enseña:\s*charter/i.test(text);
-    // intenta sacar dirección básica (opcional)
-    let addr = "";
-    const m = text.match(/\b(Direcci[oó]n|Adre[cs]a|Domicilio)\s*:\s*([^\n\r]+)\b/i);
-    if(m) addr = strip(m[2]);
-    return { isCharter, addrHint: addr };
-  }catch{ return { isCharter:false, addrHint:"" }; }
-}
-
-// pool simple
-async function mapPool(items, fn, size=8){
-  const out=[]; let i=0;
-  async function worker(){
-    while(i<items.length){
-      const idx=i++; const r=await fn(items[idx], idx); if(r!==undefined) out.push(r);
-      await sleep(40);
-    }
-  }
-  await Promise.all(Array.from({length:size}, worker));
-  return out;
-}
-
-function toFeature(id, det, rawGeom, addrHint){
-  const geom = det.geom || rawGeom;
-  if(!geom || !Array.isArray(geom.coordinates)) return null;
-  const name = det.name || "";
-  const address = strip(det.desc || addrHint || "");
-  return {
-    type:"Feature",
-    geometry: geom,
-    properties:{ id, name, address, brand:"Charter", icon: det.icon || "" , source:"bcn" }
-  };
-}
-
 async function main(){
-  // 1) ids desde paginación “que funciona”
-  const { ids, raws } = await fetchAllIds();
-  console.log("IDS BCN:", ids.length);
+  const browser = await chromium.launch({ args:["--no-sandbox"] });
+  const page = await browser.newPage({ viewport:{ width:1280, height:900 } });
 
-  // mapa id -> geom del feed
-  const rawGeom = new Map();
-  for(const f of raws){ const id=String(f?.properties?.entity_id||""); if(id && f?.geometry) rawGeom.set(id, f.geometry); }
+  // Captura de errores en consola para depurar
+  page.on("pageerror", e=>console.log("PAGEERR:", String(e).slice(0,160)));
 
-  // 2) detalle por ID
-  const details = new Map();
-  await mapPool(ids, async (id)=>{
-    const det = await getDetailsById(id);
-    details.set(id, det);
-  }, 8);
+  await page.goto(START, { waitUntil:"domcontentloaded" });
 
-  // 3) charterness por icon/text o fallback /node/{id}
-  const feats = [];
-  for (const id of ids){
-    const det = details.get(id) || {};
-    let isCharter = /charter/i.test(det.icon||"") || /\bcharter\b/i.test(`${det.name||""} ${det.desc||""}`);
-    let addrHint = "";
-    if(!isCharter){
-      const htmlFlag = await getHtmlFlagByNode(id);
-      isCharter = htmlFlag.isCharter;
-      addrHint = htmlFlag.addrHint;
-    }
-    if(isCharter){
-      const feat = toFeature(id, det, rawGeom.get(id), addrHint);
-      if(feat) feats.push(feat);
-    }
+  // 1) Cerrar cookies OneTrust
+  try{
+    await page.waitForSelector('#onetrust-accept-btn-handler, #onetrust-reject-all-handler', { timeout: 6000 });
+    await page.locator('#onetrust-reject-all-handler, #onetrust-accept-btn-handler').first().click({ force:true });
+    await page.keyboard.press('Escape').catch(()=>{});
+    await page.evaluate(()=>{ const sdk=document.getElementById('onetrust-consent-sdk'); if(sdk) sdk.remove(); });
+  }catch{}
+
+  // 2) Cambiar a "Listado"
+  try{
+    const listado = page.getByText(/Listado/i).first();
+    if(await listado.isVisible()) await listado.click({ force:true });
+  }catch{}
+
+  await page.waitForLoadState("networkidle");
+  await sleep(400);
+
+  // 3) Activar filtro Charter
+  try{
+    const charter = page.getByText(/Charter/i).first();
+    if(await charter.isVisible()) await charter.click({ force:true });
+  }catch{}
+  await page.waitForLoadState("networkidle");
+  await sleep(400);
+
+  // 4) Recolector de una página de listado
+  async function scrapeListPage(){
+    return await page.evaluate(()=>{
+      const out = [];
+      // Preferencia: elementos con data-entity-id
+      document.querySelectorAll('[data-entity-id]').forEach(el=>{
+        const id = String(el.getAttribute('data-entity-id')||'').trim();
+        if(!id) return;
+        const card = el.closest('article,li,div') || el;
+        const name = (card.querySelector('h3,h2,.title')?.textContent||'').trim();
+        const addr = (card.querySelector('[class*="domicilio"], [class*="address"], .address, p')?.textContent||'').trim();
+        const href = card.querySelector('a[href]')?.getAttribute('href') || '';
+        out.push({ id, name, addr, href });
+      });
+      // Fallback: IDs en enlaces /node/123
+      document.querySelectorAll('a[href*="/node/"]').forEach(a=>{
+        const m = a.getAttribute('href').match(/\/node\/(\d+)/);
+        if(!m) return;
+        const id = m[1];
+        if(out.some(x=>x.id===id)) return;
+        const card = a.closest('article,li,div') || a;
+        const name = (card.querySelector('h3,h2,.title')?.textContent||a.textContent||'').trim();
+        const addr = (card.querySelector('[class*="domicilio"], [class*="address"], .address, p')?.textContent||'').trim();
+        out.push({ id, name, addr, href: a.getAttribute('href') });
+      });
+      return out;
+    });
   }
 
-  const fc = {
-    type:"FeatureCollection",
-    features: feats,
-    metadata:{ source:"bcn:get-map-list + get-map/{id} + node/{id}", ids_total: ids.length, charter: feats.length, generated_at: new Date().toISOString() }
-  };
+  // 5) Paginar hasta no crecer
+  const seen = new Map(); // id -> {name,addr}
+  let stagnant = 0;
+  for(let pageIdx=0; pageIdx<80; pageIdx++){
+    const rows = await scrapeListPage();
+    let grew = 0;
+    for(const r of rows){
+      if(!r.id) continue;
+      if(!seen.has(r.id)) { seen.set(r.id, { name:r.name, addr:r.addr }); grew++; }
+    }
+    // Avanzar
+    const next = page.locator('button[aria-label="Siguiente"], a[aria-label="Siguiente"], text=Siguiente').first();
+    const canNext = await next.isVisible().catch(()=>false);
+    if(!canNext){ break; }
+    await next.click({ force:true });
+    await page.waitForLoadState("networkidle");
+    await sleep(300);
+
+    stagnant = grew===0 ? stagnant+1 : 0;
+    if(stagnant>=2) break;
+  }
+
+  const ids = [...seen.keys()];
+  console.log("IDS listado (Charter):", ids.length);
+
+  await browser.close();
+
+  // 6) Detalles por ID → coords + validación Charter
+  const feats = [];
+  for(const id of ids){
+    const det = await getDetailsById(id);
+    const text = `${det.name||""} ${det.desc||""}`;
+    if(!isCharter(det.icon, text)) continue;
+    const g = det.geom;
+    if(!g || !Array.isArray(g.coordinates)) continue;
+    feats.push({
+      type:"Feature",
+      geometry: g,
+      properties:{
+        id,
+        name: det.name || seen.get(id)?.name || "",
+        address: strip(det.desc || seen.get(id)?.addr || ""),
+        brand: "Charter",
+        icon: det.icon || ""
+      }
+    });
+    await sleep(40);
+  }
+
+  // 7) Escribir GeoJSON
+  const fc = { type:"FeatureCollection", features: feats, metadata:{ source:"listado Charter + get-map/{id}", ids: ids.length, charter: feats.length, generated_at: new Date().toISOString() } };
   await fs.mkdir("docs",{recursive:true});
   await fs.writeFile(OUT, JSON.stringify(fc));
-  console.log(`IDS=${ids.length}  CHARTER=${feats.length}  → ${OUT}`);
+  console.log(`LIST_IDS=${ids.length}  CHARTER=${feats.length}  → ${OUT}`);
 }
+
 main().catch(e=>{ console.error(e); process.exit(1); });
