@@ -1,0 +1,82 @@
+// scripts/step2_feed.js — lee un feed y lo vuelca a GeoJSON sin filtros
+import fs from "node:fs/promises";
+
+const FEED = "https://www.consum.es/get-map-list/block_supermercados_en_barcelona/";
+const OUT  = "docs/charter.geojson";
+
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+const strip = (s="") => String(s).replace(/<[^>]*>/g," ").replace(/\s+/g," ").trim();
+
+async function getText(url){
+  for(let i=1;i<=3;i++){
+    try{
+      const r = await fetch(url, { headers:{accept:"*/*"} });
+      const t = await r.text();
+      if(!r.ok) throw new Error(`HTTP ${r.status} ${t.slice(0,120)}`);
+      return t;
+    }catch(e){ if(i===3) throw e; await sleep(300*i); }
+  }
+}
+
+// encuentra "features" aunque vengan anidadas (Drupal)
+function findFeatures(obj){
+  if(!obj) return null;
+  if(Array.isArray(obj)){ for(const el of obj){ const f = findFeatures(el); if(f) return f; } return null; }
+  if(typeof obj==="object"){
+    if(Array.isArray(obj.features)) return obj.features;
+    for(const v of Object.values(obj)){ const f = findFeatures(v); if(f) return f; }
+  }
+  return null;
+}
+
+function toFeature(raw){
+  // coords: geometry o field_coordenadas (WKT o "lat, lon")
+  let lon=null, lat=null;
+  const c = raw?.geometry?.coordinates;
+  if(Array.isArray(c) && c.length>=2){ lon=+c[0]; lat=+c[1]; }
+  const coordStr = raw?.properties?.data?.field_coordenadas || raw?.properties?.field_coordenadas;
+  if((lon==null||lat==null) && coordStr){
+    let m = /POINT\s*\(\s*(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s*\)/i.exec(String(coordStr));
+    if(m){ lon=+m[1]; lat=+m[2]; }
+    if(lon==null||lat==null){
+      m = /(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)/.exec(String(coordStr)); // lat, lon
+      if(m){ lat=+m[1]; lon=+m[2]; }
+    }
+  }
+  if(lon==null||lat==null) return null;
+
+  const id   = String(raw?.properties?.entity_id || "").trim() || strip(`${raw?.properties?.tooltip||""}|${raw?.properties?.description||""}`);
+  const name = strip(raw?.properties?.tooltip || raw?.properties?.title || "");
+  const addr = strip(raw?.properties?.data?.field_domicilio || raw?.properties?.field_domicilio || raw?.properties?.description || "");
+  const icon = String(raw?.properties?.icon || "");
+
+  return {
+    type:"Feature",
+    geometry:{ type:"Point", coordinates:[lon,lat] },
+    properties:{ id, name, address: addr, icon, source: FEED }
+  };
+}
+
+async function main(){
+  const txt = await getText(FEED);
+  const j = JSON.parse(txt);
+  const feats = findFeatures(j) || [];
+  const mapped = feats.map(toFeature).filter(Boolean);
+
+  const fc = {
+    type:"FeatureCollection",
+    features: mapped,
+    metadata: {
+      source: FEED,
+      generated_at: new Date().toISOString(),
+      total_raw: feats.length,
+      total_mapped: mapped.length
+    }
+  };
+
+  await fs.mkdir("docs",{recursive:true});
+  await fs.writeFile(OUT, JSON.stringify(fc));
+  console.log(`RAW=${feats.length}  MAPPED=${mapped.length}  → ${OUT}`);
+  if (mapped[0]) console.log("SAMPLE:", mapped[0].properties);
+}
+main().catch(e=>{ console.error(e); process.exit(1); });
