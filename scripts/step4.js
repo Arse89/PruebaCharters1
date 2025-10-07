@@ -1,71 +1,73 @@
-// Barcelona: pagina TODO y confirma Charter por get-map/{id}
+// step5: Barcelona via Drupal Views AJAX → IDs → get-map/{id} → solo Charter
 import fs from "node:fs/promises";
-const BASE = "https://www.consum.es/get-map-list/block_supermercados_en_barcelona/";
+
+const FEED = "https://www.consum.es/get-map-list/block_supermercados_en_barcelona/";
 const OUT  = "docs/charter.geojson";
 
-const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
-const strip = (s="")=>String(s).replace(/<[^>]*>/g," ").replace(/\s+/g," ").trim();
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+const strip = s => String(s||"").replace(/<[^>]*>/g," ").replace(/\s+/g," ").trim();
 
-async function getText(url, ms=12000){
-  const ctrl = new AbortController(); const t=setTimeout(()=>ctrl.abort(),ms);
+async function getText(url, {method="GET", body=null, timeout=12000, headers={}} = {}){
+  const ctrl = new AbortController(); const t = setTimeout(()=>ctrl.abort(), timeout);
   try{
-    const r = await fetch(url, { headers:{accept:"*/*"}, signal:ctrl.signal });
-    const x = await r.text();
-    if(!r.ok) throw new Error(`HTTP ${r.status} ${x.slice(0,120)}`);
-    return x;
+    const r = await fetch(url, { method, body, headers: { accept:"*/*", ...headers }, signal: ctrl.signal });
+    const txt = await r.text();
+    if(!r.ok) throw new Error(`HTTP ${r.status} ${txt.slice(0,120)}`);
+    return txt;
   } finally { clearTimeout(t); }
 }
-function findFeatures(o){
-  if(!o) return null;
-  if(Array.isArray(o)){ for(const x of o){ const f=findFeatures(x); if(f) return f; } return null; }
-  if(typeof o==="object"){
-    if(Array.isArray(o.features)) return o.features;
-    for(const v of Object.values(o)){ const f=findFeatures(v); if(f) return f; }
+const getJson = async (url, opt={}) => JSON.parse(await getText(url, opt));
+
+function find(obj, pred){
+  if(!obj) return null;
+  if(Array.isArray(obj)){ for(const x of obj){ const f=find(x,pred); if(f) return f; } return null; }
+  if(typeof obj==="object"){
+    if(pred(obj)) return obj;
+    for(const v of Object.values(obj)){ const f=find(v,pred); if(f) return f; }
   }
   return null;
 }
-async function fetchPage(url){
-  try{ return findFeatures(JSON.parse(await getText(url))) || []; } catch { return []; }
+const findFeatures = (o)=> find(o, x => Array.isArray(x.features))?.features || [];
+
+async function discoverParams(){
+  const j = await getJson(FEED); // el feed inicial suele incluir los params de la View
+  const p = {};
+  const grab = (k) => (find(j, x => typeof x[k]==="string")||{})[k];
+  p.view_name      = grab("view_name")      || "supermercados";
+  p.view_display_id= grab("view_display_id")|| "block_supermercados_en_barcelona";
+  p.view_args      = grab("view_args")      || "";
+  p.view_path      = grab("view_path")      || "/supermercados/";
+  p.view_dom_id    = grab("view_dom_id")    || "map";
+  const ajaxBase = FEED.includes("/va/") ? "https://www.consum.es/va/views/ajax" : "https://www.consum.es/views/ajax";
+  return { p, ajaxBase, first: findFeatures(j) };
 }
 
-// pagina con corte por “no crecimiento”
-async function fetchAll(){
-  const seen = new Set(); const raws = [];
-  const first = await fetchPage(BASE);
-  for(const f of first){ const id=String(f?.properties?.entity_id||""); if(id && !seen.has(id)){ seen.add(id); raws.push(f);} }
-  for(const mode of ["page","p"]){
-    let stagnant=0;
-    for(let i=1;i<=20;i++){
-      const u = `${BASE}?${mode}=${i}`;
-      const feats = await fetchPage(u);
-      let grew=0;
-      for(const f of feats){
-        const id=String(f?.properties?.entity_id||"");
-        if(id && !seen.has(id)){ seen.add(id); raws.push(f); grew++; }
-      }
-      if(grew===0) stagnant++; else stagnant=0;
-      if(stagnant>=2) break;
-      await sleep(120);
-    }
-  }
-  return { raws, ids:[...seen] };
+async function fetchPage(ajaxBase, p, page){
+  const form = new URLSearchParams({
+    view_name: p.view_name,
+    view_display_id: p.view_display_id,
+    view_args: p.view_args,
+    view_path: p.view_path,
+    view_dom_id: p.view_dom_id,
+    pager_element: "0",
+    page: String(page)
+  });
+  const txt = await getText(ajaxBase, { method:"POST", body: form, headers:{ "content-type":"application/x-www-form-urlencoded" } }).catch(()=>null);
+  if(!txt) return [];
+  let arr; try{ arr = JSON.parse(txt); } catch { return []; }
+  return findFeatures(arr) || [];
 }
 
 async function getDetailsById(id){
-  const urls = [
-    `https://www.consum.es/get-map/${id}/`,
-    `https://www.consum.es/va/get-map/${id}/`
-  ];
-  for(const u of urls){
+  for(const base of ["https://www.consum.es","https://www.consum.es/va"]){
     try{
-      const txt = await getText(u, 10000);
-      const j = JSON.parse(txt);
+      const j = await getJson(`${base}/get-map/${id}/`);
       const f = (findFeatures(j)||[])[0];
       if(!f) continue;
       return {
         icon: String(f?.properties?.icon||""),
-        name: strip(f?.properties?.tooltip||f?.properties?.title||""),
-        desc: strip(f?.properties?.description||""),
+        name: strip(f?.properties?.tooltip || f?.properties?.title || ""),
+        desc: strip(f?.properties?.description || ""),
         geom: f?.geometry || null
       };
     }catch{}
@@ -86,61 +88,49 @@ async function mapPool(items, fn, size=8){
   return out;
 }
 
-function toFeature(id, det, rawGeom){
-  const geom = det.geom || rawGeom;
-  if(!geom || !Array.isArray(geom.coordinates)) return null;
-  const isCharter = /charter/i.test(det.icon||"") || /\bcharter\b/i.test(`${det.name||""} ${det.desc||""}`);
-  if(!isCharter) return null;
-  return {
-    type:"Feature",
-    geometry: geom,
-    properties:{
-      id,
-      name: det.name||"",
-      address: strip(det.desc||""),
-      brand:"Charter",
-      icon: det.icon||"",
-      source: BASE
-    }
-  };
-}
-
 async function main(){
-  const { raws, ids } = await fetchAll();
-  // mapa id -> geom del feed por si detalle no trae geom
-  const rawGeom = new Map();
-  for(const f of raws){
-    const id=String(f?.properties?.entity_id||"");
-    if(id && f?.geometry) rawGeom.set(id, f.geometry);
-  }
+  // 1) Descubre params + primera página
+  const { p, ajaxBase, first } = await discoverParams();
 
-  // detalles por ID en paralelo
+  // 2) Recorre páginas hasta no crecer
+  const seen = new Set(); const raws = [];
+  const add = (feats)=>{ let a=0; for(const f of feats){ const id=String(f?.properties?.entity_id||""); if(id && !seen.has(id)){ seen.add(id); raws.push(f); a++; } } return a; };
+  add(first);
+  let stagnant = 0;
+  for(let page=1; page<=100; page++){
+    const feats = await fetchPage(ajaxBase, p, page);
+    const grew = add(feats);
+    stagnant = grew===0 ? stagnant+1 : 0;
+    if(stagnant>=2) break;
+    await sleep(120);
+  }
+  console.log(`VIEWS_PAGES≈${seen.size? (stagnant? "end":"limit") : 0}  IDS=${seen.size}`);
+
+  // 3) Detalle por ID y filtro Charter
+  const idList = [...seen];
   const details = new Map();
-  await mapPool(ids, async (id)=>{
-    const det = await getDetailsById(id);
-    details.set(id, det);
-    return true;
-  }, 8);
+  await mapPool(idList, async (id)=>{ details.set(id, await getDetailsById(id)); return true; }, 8);
 
-  // construir GeoJSON solo Charter
-  const feats=[];
-  for(const id of ids){
-    const f = toFeature(id, details.get(id)||{}, rawGeom.get(id));
-    if(f) feats.push(f);
+  const featsOut = [];
+  for(const id of idList){
+    const det = details.get(id) || {};
+    const icon = det.icon || "";
+    const text = `${det.name||""} ${det.desc||""}`;
+    const isCharter = /charter/i.test(icon) || /\bcharter\b/i.test(text);
+    const geom = det.geom;
+    if(isCharter && geom && Array.isArray(geom.coordinates)){
+      featsOut.push({
+        type:"Feature",
+        geometry: geom,
+        properties:{ id, name: det.name||"", address: strip(det.desc||""), brand:"Charter", icon }
+      });
+    }
   }
 
-  const fc = {
-    type:"FeatureCollection",
-    features: feats,
-    metadata:{
-      source: BASE,
-      ids_total: ids.length,
-      charter: feats.length,
-      generated_at: new Date().toISOString()
-    }
-  };
+  const fc = { type:"FeatureCollection", features: featsOut,
+               metadata:{ source:"views/ajax + get-map/{id}", ids_total:idList.length, charter:featsOut.length, generated_at:new Date().toISOString() } };
   await fs.mkdir("docs",{recursive:true});
   await fs.writeFile(OUT, JSON.stringify(fc));
-  console.log(`IDS=${ids.length}  CHARTER=${feats.length}  → ${OUT}`);
+  console.log(`IDS=${idList.length}  CHARTER=${featsOut.length}  → ${OUT}`);
 }
 main().catch(e=>{ console.error(e); process.exit(1); });
