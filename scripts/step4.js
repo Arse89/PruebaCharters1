@@ -1,20 +1,22 @@
-// Crawl ligero: páginas de ciudad -> fichas de tienda -> filtra Charter -> coords por get-map/{id}
+// Crawl por ciudades (ES + VA) -> fichas -> node id robusto -> get-map/{id} -> filtra Charter
 import fs from "node:fs/promises";
 
-const ORIGIN = "https://www.consum.es";
-const CITY_SLUGS = [
-  "barcelona","valencia","alicante","castellon","murcia","albacete"
-]; // añade más si procede
+const ORIGIN_ES = "https://www.consum.es";
+const ORIGIN_VA = "https://www.consum.es/va";
+
+const CITY_SLUGS_ES = ["barcelona","valencia","alicante","castellon","murcia","albacete"];
+const CITY_SLUGS_VA = ["barcelona","valencia","alicante","castello","murcia","albacete"]; // añade "valencia/valència" si lo ves en producción
+
 const OUT = "docs/charter.geojson";
 
 const sleep = ms => new Promise(r=>setTimeout(r,ms));
 const strip = s => String(s||"").replace(/<[^>]*>/g," ").replace(/\s+/g," ").trim();
-const isCharterText = t => /\bcharter\b/i.test(String(t||""));
+const isCharter = (icon="", text="") => /charter/i.test(icon) || /\bcharter\b/i.test(text);
 
 async function get(u, ms=12000){
   const c = new AbortController(); const t=setTimeout(()=>c.abort(), ms);
   try{
-    const r = await fetch(u, { headers:{ "accept":"text/html,*/*" }, signal:c.signal });
+    const r = await fetch(u, { headers:{accept:"text/html,*/*"}, signal:c.signal });
     const txt = await r.text();
     if(!r.ok) throw new Error(`GET ${u} -> ${r.status}`);
     return txt;
@@ -22,70 +24,103 @@ async function get(u, ms=12000){
 }
 async function getJson(u, ms=12000){
   const txt = await get(u, ms);
-  try{ return JSON.parse(txt); } catch { throw new Error("Bad JSON "+u); }
+  try{ return JSON.parse(txt); }catch{ throw new Error("Bad JSON "+u); }
 }
 
-function pickLinksToStores(html){
+// -------- extracción de URLs de tienda desde listados --------
+function pickLinksToStores(html, origin){
   const urls = new Set();
-  const re = /href=["'](\/supermercados\/[^"'#?]+\/)["']/gi;
-  let m;
-  while((m = re.exec(html))) {
-    const u = m[1];
-    // descarta listados de ciudad y repite
-    if (/\/supermercados\/[^/]+\/$/.test(u)) continue;
-    urls.add(ORIGIN + u);
+
+  // ES: /supermercados/<ciudad>/<slug-tienda>
+  const reES = /href=["'](\/supermercados\/[^"'#?]+\/[^"'#?\/]+)["']/gi;
+  let m; while((m=reES.exec(html))) urls.add(origin + m[1]);
+
+  // VA: /va/supermercats/<ciutat>/<slug-tenda>
+  const reVA = /href=["'](\/va\/supermercats\/[^"'#?]+\/[^"'#?\/]+)["']/gi;
+  while((m=reVA.exec(html))) urls.add(origin + m[1]);
+
+  // filtra listados (acaban en /ciudad/)
+  for(const u of [...urls]){
+    if(/\/supermercados\/[^/]+\/$/i.test(u) || /\/va\/supermercats\/[^/]+\/$/i.test(u)) urls.delete(u);
   }
   return urls;
 }
+
+// -------- extracción robusta de node id en ficha --------
 function pickNodeId(html){
-  // suele aparecer en enlaces "Conocer la tienda" o scripts
-  const m1 = html.match(/\/node\/(\d+)/);
-  if(m1) return m1[1];
-  // a veces como data-entity-id
-  const m2 = html.match(/data-entity-id=["'](\d+)["']/);
-  if(m2) return m2[1];
+  // <link rel="shortlink" href="https://www.consum.es/node/123456">
+  let m = html.match(/rel=["']shortlink["'][^>]+href=["'][^"']*\/node\/(\d+)["']/i);
+  if(m) return m[1];
+
+  // cualquier /node/123456 en HTML
+  m = html.match(/\/node\/(\d+)/);
+  if(m) return m[1];
+
+  // data-entity-id="123456"
+  m = html.match(/data-entity-id=["'](\d+)["']/i);
+  if(m) return m[1];
+
+  // JSON incrustado: "entity_id": 123456  |  'entity_id':'123456'
+  m = html.match(/["']entity_id["']\s*:\s*["']?(\d+)["']?/i);
+  if(m) return m[1];
+
   return null;
 }
 
-async function getCoordsById(id){
-  for(const base of [ORIGIN, ORIGIN + "/va"]){
+// -------- detalle por id --------
+function findFeature(o){
+  if(!o) return null;
+  if(Array.isArray(o)){ for(const x of o){ const f=findFeature(x); if(f) return f; } return null; }
+  if(typeof o==="object"){
+    if(Array.isArray(o.features) && o.features[0]) return o.features[0];
+    for(const v of Object.values(o)){ const f=findFeature(v); if(f) return f; }
+  }
+  return null;
+}
+async function getDetailsById(id){
+  for(const base of [ORIGIN_ES, ORIGIN_VA]){
     try{
       const j = await getJson(`${base}/get-map/${id}/`, 10000);
-      // buscar Feature con geometry
-      const feat = (function findFeatures(o){
-        if(!o) return null;
-        if(Array.isArray(o)){ for(const x of o){ const f = findFeatures(x); if(f) return f; } return null; }
-        if(typeof o==="object"){
-          if(Array.isArray(o.features)) return o.features[0] || null;
-          for(const v of Object.values(o)){ const f = findFeatures(v); if(f) return f; }
-        }
-        return null;
-      })(j);
-      const g = feat?.geometry;
-      const name = strip(feat?.properties?.tooltip || feat?.properties?.title || "");
-      const desc = strip(feat?.properties?.description || "");
-      const icon = String(feat?.properties?.icon || "");
-      return { geom: g || null, name, desc, icon };
+      const f = findFeature(j);
+      if(!f) continue;
+      const icon = String(f?.properties?.icon||"");
+      const name = strip(f?.properties?.tooltip || f?.properties?.title || "");
+      const desc = strip(f?.properties?.description || "");
+      const geom = f?.geometry || null;
+      return { icon, name, desc, geom };
     }catch{}
     await sleep(60);
   }
-  return { geom:null, name:"", desc:"", icon:"" };
+  return { icon:"", name:"", desc:"", geom:null };
 }
 
+// -------- paginado simple de listados de ciudad --------
 async function gatherStoreUrls(){
   const storeUrls = new Set();
-  for(const slug of CITY_SLUGS){
-    for(let page=0; page<20; page++){
-      const url = `${ORIGIN}/supermercados/${slug}/${page?`?page=${page}`:""}`;
+
+  // ES
+  for(const slug of CITY_SLUGS_ES){
+    for(let p=0; p<25; p++){
+      const url = `${ORIGIN_ES}/supermercados/${slug}/${p?`?page=${p}`:""}`;
       try{
         const html = await get(url, 10000);
-        const urls = pickLinksToStores(html);
-        if(urls.size===0 && page>0) break; // no más páginas
-        urls.forEach(u=>storeUrls.add(u));
-      }catch{
-        if(page===0) break;
-        else continue;
-      }
+        const batch = pickLinksToStores(html, ORIGIN_ES);
+        if(batch.size===0 && p>0) break;
+        batch.forEach(u=>storeUrls.add(u));
+      }catch{}
+      await sleep(120);
+    }
+  }
+  // VA
+  for(const slug of CITY_SLUGS_VA){
+    for(let p=0; p<25; p++){
+      const url = `${ORIGIN_VA}/supermercats/${slug}/${p?`?page=${p}`:""}`;
+      try{
+        const html = await get(url, 10000);
+        const batch = pickLinksToStores(html, ORIGIN_VA);
+        if(batch.size===0 && p>0) break;
+        batch.forEach(u=>storeUrls.add(u));
+      }catch{}
       await sleep(120);
     }
   }
@@ -98,58 +133,44 @@ async function main(){
 
   const feats = [];
   let i = 0;
+
   for(const u of storeUrls){
     i++;
     let html;
-    try { html = await get(u, 12000); }
-    catch { continue; }
+    try { html = await get(u, 12000); } catch { continue; }
 
-    const text = strip(html);
-    if(!isCharterText(text)) continue; // no marca Charter en la ficha
-
-    // nombre y dirección aproximados desde H1 y párrafos
-    const name = (text.match(/^(CHARTER\s+)?([A-ZÁÉÍÓÚÑ0-9 .,'\-]+)\s*\n/i)?.[2] || "") || (text.match(/Supermercado en\s+([^\n]+)/i)?.[1] || "");
-    let address = "";
-    const mAddr = text.match(/\b(Carrer|C\/|Avda\.?|Avenida|Av\.)[^\n]+?\d[^,\n]*(?:,\s*\d{5})?,?\s*[A-ZÁÉÍÓÚÑ][^\n]+/i);
-    if(mAddr) address = strip(mAddr[0]);
-
-    // intenta coords por node id
+    // id
     const id = pickNodeId(html);
-    let geom = null, icon = "";
-    if(id){
-      const det = await getCoordsById(id);
-      geom = det.geom;
-      icon = det.icon;
-      // si el detalle trae Charter en icon/text mejor
-      if(!isCharterText(text) && !isCharterText(`${det.name} ${det.desc} ${det.icon}`)) continue;
-      if(!address) address = strip(det.desc || address);
-    }
+    if(!id) continue;
 
-    if(!geom){
-      // sin coords no pintamos en el mapa
-      continue;
-    }
+    // detalle
+    const det = await getDetailsById(id);
+    const text = `${det.name||""} ${det.desc||""}`;
+    if(!isCharter(det.icon, text)) continue;
+
+    const g = det.geom;
+    if(!g || !Array.isArray(g.coordinates)) continue;
 
     feats.push({
       type:"Feature",
-      geometry: geom,
+      geometry: g,
       properties:{
-        id: id || u,
-        name: strip(name)||"",
-        address: address||"",
+        id,
+        name: det.name || "",
+        address: strip(det.desc || ""),
         brand: "Charter",
-        icon,
+        icon: det.icon || "",
         url: u
       }
     });
 
-    if(i % 25 === 0) await sleep(200);
+    if(i % 25 === 0) await sleep(150);
   }
 
-  await fs.mkdir("docs", { recursive: true });
-  const fc = { type:"FeatureCollection", features: feats, metadata:{ cities: CITY_SLUGS, urls_seen: storeUrls.length, charter: feats.length, generated_at: new Date().toISOString() } };
+  await fs.mkdir("docs",{recursive:true});
+  const fc = { type:"FeatureCollection", features: feats,
+    metadata:{ urls_seen: storeUrls.length, charter: feats.length, generated_at: new Date().toISOString() } };
   await fs.writeFile(OUT, JSON.stringify(fc));
-  console.log(`FIN → tiendas vistas=${storeUrls.length}  charter=${feats.length}  escrito=${OUT}`);
+  console.log(`FIN → vistas=${storeUrls.length}  charter=${feats.length}  → ${OUT}`);
 }
-
 main().catch(e=>{ console.error(e); process.exit(1); });
