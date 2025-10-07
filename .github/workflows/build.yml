@@ -36,7 +36,7 @@ jobs:
           npx playwright install chromium
 
       - name: Construir dataset (listado Charter)
-        run: node scripts/sweep_charter_list.js
+        run: node scripts/step4.js
 
       - name: Snapshot diario
         run: |
