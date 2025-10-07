@@ -1,0 +1,33 @@
+{
+  "city_paths": [
+    "/supermercados/barcelona/",
+    "/va/supermercats/barcelona/"
+  ],
+  "total_urls": 3,
+  "ids": 0,
+  "detail": 0,
+  "charter": 0,
+  "sample": [
+    {
+      "url": "https://www.consum.es/supermercados/barcelona/2/",
+      "id": null,
+      "icon": null,
+      "name": null,
+      "charter": false
+    },
+    {
+      "url": "https://www.consum.es/supermercados/barcelona/3/",
+      "id": null,
+      "icon": null,
+      "name": null,
+      "charter": false
+    },
+    {
+      "url": "https://www.consum.es/supermercados/barcelona/12/",
+      "id": null,
+      "icon": null,
+      "name": null,
+      "charter": false
+    }
+  ]
+}
