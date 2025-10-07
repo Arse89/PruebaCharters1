@@ -7,17 +7,42 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: build-dataset
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+
+      # Cache node_modules por lockfile (si lo tienes)
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
-      - name: Construir dataset (step2)
-        run: node scripts/step4.js
+        with:
+          node-version: 20
+          cache: npm
+
+      # Cache de navegadores Playwright
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-chromium-v1
+          restore-keys: |
+            pw-${{ runner.os }}-
+
+      - name: Instalar deps + Chromium
+        run: |
+          npm i --no-audit --no-fund
+          npx playwright install chromium
+
+      - name: Construir dataset (listado Charter)
+        run: node scripts/sweep_charter_list.js
+
       - name: Snapshot diario
         run: |
           mkdir -p docs/history
           cp docs/charter.geojson docs/history/$(date +%F).geojson || true
+
       - name: Commit si hay cambios
         run: |
           git config user.name bot
