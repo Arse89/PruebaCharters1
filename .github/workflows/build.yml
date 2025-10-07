@@ -1,24 +1,22 @@
-name: Build dataset (ciudades)
+name: Probe Charter get-map
 permissions: { contents: write }
-on:
-  workflow_dispatch:
+on: { workflow_dispatch: {} }
 
 jobs:
-  build:
+  probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
-      - name: Construir dataset
+      - name: Ejecutar sonda
         run: node scripts/step4.js
-      - name: Commit si hay cambios
+      - name: Commit debug
         run: |
           git config user.name bot
           git config user.email bot@users.noreply.github.com
-          git add docs/charter.geojson 2>/dev/null || true
+          git add docs/debug/probe.json 2>/dev/null || true
           git diff --cached --quiet && echo "Sin cambios" && exit 0
-          git commit -m "data: update $(date +%F)"
+          git commit -m "probe: $(date +%F_%T)"
           git push
