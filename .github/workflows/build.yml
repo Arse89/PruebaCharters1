@@ -10,27 +10,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: ms-playwright-${{ runner.os }}-v1
-          restore-keys: |
-            ms-playwright-
-      - name: Instalar deps
-        run: |
-          npm i --no-audit --no-fund
-          npx playwright install --with-deps
-      - name: Construir dataset
-        run: node scripts/sweep_charter.js
+
+      - name: Construir dataset (step2)
+        run: node scripts/step2_feed.js
+
       - name: Snapshot diario
         run: |
           mkdir -p docs/history
           cp docs/charter.geojson docs/history/$(date +%F).geojson || true
+
       - name: Commit si hay cambios
         run: |
           git config user.name bot
@@ -39,3 +31,4 @@ jobs:
           git diff --cached --quiet && echo "Sin cambios" && exit 0
           git commit -m "data: update $(date +%F)"
           git push
+```0
